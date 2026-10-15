@@ -1,0 +1,101 @@
+name: Calidad
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# El análisis corre contra una instancia de SonarQube que se levanta aquí mismo
+# como contenedor, así que no depende de un servicio externo ni de un token
+# guardado en el repositorio. El resultado queda como artefacto de la corrida.
+jobs:
+  analisis:
+    name: Análisis estático y cobertura
+    runs-on: ubuntu-latest
+
+    services:
+      sonarqube:
+        image: sonarqube:community
+        ports:
+          - 9000:9000
+        env:
+          SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+
+    steps:
+      - name: Clonar el repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pruebas con cobertura
+        run: |
+          docker run --rm \
+            -v "$PWD:/app" -w /app \
+            -u "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            node:25-bookworm-slim \
+            bash -c "corepack enable && pnpm install --frozen-lockfile && pnpm test:coverage"
+
+      - name: Esperar a que SonarQube esté arriba
+        run: |
+          for i in $(seq 1 60); do
+            estado=$(curl -s http://localhost:9000/api/system/status | sed -n 's/.*"status":"\([A-Z]*\)".*/\1/p')
+            echo "intento $i: ${estado:-sin respuesta}"
+            [ "$estado" = "UP" ] && exit 0
+            sleep 10
+          done
+          echo "SonarQube no quedó listo a tiempo"
+          docker logs "$(docker ps -q --filter ancestor=sonarqube:community | head -1)" 2>&1 | tail -40
+          exit 1
+
+      - name: Preparar credenciales del análisis
+        id: sonar
+        run: |
+          # La instancia arranca con admin/admin y exige cambiar la clave antes de operar.
+          curl -s -u admin:admin -X POST \
+            "http://localhost:9000/api/users/change_password?login=admin&previousPassword=admin&password=Analisis.2026" \
+            >/dev/null || true
+          TOKEN=$(curl -s -u admin:Analisis.2026 -X POST \
+            "http://localhost:9000/api/user_tokens/generate?name=ci-$RANDOM" \
+            | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+          if [ -z "$TOKEN" ]; then
+            echo "no se pudo generar el token del análisis"; exit 1
+          fi
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Escáner en contenedor
+        run: |
+          docker run --rm --network host \
+            -v "$PWD:/usr/src" \
+            -u "$(id -u):$(id -g)" \
+            sonarsource/sonar-scanner-cli:latest \
+            -Dsonar.host.url=http://localhost:9000 \
+            -Dsonar.token=${{ steps.sonar.outputs.token }} \
+            -Dsonar.projectKey=flp-viewer \
+            -Dsonar.projectName=flp-viewer \
+            -Dsonar.scm.disabled=true
+
+      - name: Recoger los resultados
+        run: |
+          python3 ci/recoger-resultados.py \
+            http://localhost:9000 \
+            "${{ steps.sonar.outputs.token }}" \
+            flp-viewer \
+            resultados-calidad
+          cp -r coverage resultados-calidad/cobertura 2>/dev/null || true
+          cp .scannerwork/report-task.txt resultados-calidad/ 2>/dev/null || true
+
+      - name: Publicar el resumen en la corrida
+        if: always()
+        run: cat resultados-calidad/resumen.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Guardar el artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calidad-${{ github.sha }}
+          path: resultados-calidad
+          if-no-files-found: warn
+          retention-days: 30
