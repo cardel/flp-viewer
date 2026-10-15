@@ -76,7 +76,8 @@ jobs:
             -Dsonar.token=${{ steps.sonar.outputs.token }} \
             -Dsonar.projectKey=flp-viewer \
             -Dsonar.projectName=flp-viewer \
-            -Dsonar.scm.disabled=true
+            -Dsonar.scm.disabled=true \
+            -Dsonar.working.directory=/usr/src/.scannerwork
 
       - name: Recoger los resultados
         run: |
